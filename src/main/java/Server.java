@@ -1,8 +1,14 @@
+import org.apache.http.NameValuePair;
+import org.apache.http.client.utils.URLEncodedUtils;
+
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
+import java.net.URI;
+import java.net.URISyntaxException;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -57,58 +63,98 @@ public class Server {
                 final byte[] buffer = new byte[limit];
                 final int read = in.read(buffer);
 
-                final int requestLineEnd = indexOf(buffer, requestLineDelimiter, 0, read);
-                if (requestLineEnd == -1) {
+                RequestLine requestLine = getRequestLine(buffer, read);
+                if (requestLine == null) {
                     badRequest(out);
                     return;
                 }
 
-                final String[] parts = new String(Arrays.copyOf(buffer, requestLineEnd)).split(" ");
-                if (parts.length != 3) {
+                List<String> headers = getHeaders(buffer, read, in);
+                if (headers == null) {
                     badRequest(out);
                     return;
                 }
-
-                if (!parts[1].startsWith("/")) {
-                    badRequest(out);
-                    return;
-                }
-
-                RequestLine requestLine = new RequestLine(parts[0], parts[1], parts[2]);
-
-                final int headersStart = requestLineEnd - requestLineDelimiter.length;
-                final int headersEnd = indexOf(buffer, headersDelimiter, headersStart, read);
-                if (headersEnd == -1) {
-                    badRequest(out);
-                    return;
-                }
-
-                in.reset();
-                in.skip(headersStart);
-
-                final byte[] headersBytes = in.readNBytes(headersEnd - headersStart);
-                final List<String> headers = Arrays.asList(new String(headersBytes).split("\r\n"));
 
                 Request request = new Request(requestLine, headers);
-                if (!requestLine.getMethod().equals("GET")) {
-                    in.skip(headersDelimiter.length);
-                    final Optional<String> contentLength = extractHeader(headers, "Content-Length");
-                    if (contentLength.isPresent()) {
-                        final int length = Integer.parseInt(contentLength.get());
-                        final byte[] bodyBytes = in.readNBytes(length);
+                request.setBody(getBody(request, in));
+                request.setQueryParams(getQueryParams(requestLine.getPath()));
 
-                        final String body = new String(bodyBytes);
-                        request.setBody(body);
-                    }
-                }
-
-                Handler handler = handlers.get(request.getRequestLine().getMethod())
-                        .get(request.getRequestLine().getPath());
-                handler.handle(request, out);
-            } catch (IOException e) {
+                runHAndler(request, out);
+            } catch (IOException | URISyntaxException e) {
                 e.printStackTrace();
             }
         }
+    }
+
+    private void runHAndler(Request request, BufferedOutputStream out) throws IOException {
+        Handler handler = handlers.get(request.getRequestLine().getMethod())
+                .get(request.getRequestLine().getPath());
+        if (handler != null) {
+            handler.handle(request, out);
+        } else {
+            notFound(out);
+        }
+    }
+
+    private void notFound(BufferedOutputStream out) throws IOException {
+        out.write((
+                "HTTP/1.1 404 Not Found\r\n" +
+                        "Content-Length: 0\r\n" +
+                        "Connection: close\r\n" +
+                        "\r\n"
+                ).getBytes());
+        out.flush();
+    }
+
+    private List<NameValuePair> getQueryParams(String path) throws URISyntaxException {
+        final URI uri = new URI(path);
+        return URLEncodedUtils.parse(uri, StandardCharsets.UTF_8);
+    }
+
+    private String getBody(Request request, BufferedInputStream in) throws IOException {
+        if (!request.getRequestLine().getMethod().equals("GET")) {
+            in.skip(headersDelimiter.length);
+            final Optional<String> contentLength = extractHeader(request.getHeaders(), "Content-Length");
+            if (contentLength.isPresent()) {
+                final int length = Integer.parseInt(contentLength.get());
+                final byte[] bodyBytes = in.readNBytes(length);
+                return new String(bodyBytes);
+            }
+        }
+        return null;
+    }
+
+    private List<String> getHeaders(byte[] buffer, int read, BufferedInputStream in) throws IOException {
+        final int requestLineEnd = indexOf(buffer, requestLineDelimiter, 0, read);
+
+        final int headersStart = requestLineEnd - requestLineDelimiter.length;
+        final int headersEnd = indexOf(buffer, headersDelimiter, headersStart, read);
+
+        if (headersEnd == -1) {
+            return null;
+        }
+
+        in.reset();
+        in.skip(headersStart);
+
+        final byte[] headersBytes = in.readNBytes(headersEnd - headersStart);
+        return Arrays.asList(new String(headersBytes).split("\r\n"));
+    }
+
+    private RequestLine getRequestLine(byte[] buffer, int read) {
+        final int requestLineEnd = indexOf(buffer, requestLineDelimiter, 0, read);
+        if (requestLineEnd == -1) {
+            return null;
+        }
+
+        final String[] parts = new String(Arrays.copyOf(buffer, requestLineEnd)).split(" ");
+        if (parts.length != 3) {
+            return null;
+        }
+        if(!parts[1].startsWith("/")) {
+            return null;
+        }
+        return new RequestLine(parts[0], parts[1], parts[2]);
     }
 
     private Optional<String> extractHeader(List<String> headers, String header) {
